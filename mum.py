@@ -121,7 +121,7 @@ import warnings
 import logging
 import pyddm as ddm
 import pyddm.plot
-from pyddm import Model, Fittable, Fitted, Drift
+from pyddm import Model, Fittable, Fitted, Drift, Bound
 from pyddm.functions import fit_adjust_model, display_model
 from pyddm.models import NoiseConstant, BoundConstant, OverlayChain, OverlayNonDecision, OverlayPoissonMixture, LossRobustBIC
 from pyddm.models import InitialCondition, ICPoint, ICPointSourceCenter
@@ -157,19 +157,43 @@ class ICPointFrac(InitialCondition):
         pdf[shift_i] = 1.0 / dx
         return pdf
 
+class OverlayNonDecisionUniformLeftRight(OverlayNonDecisionUniform):
+    name = "Left/right uniformly-distributed non-decision time"
+    required_parameters = ["nondectime_left", "nondectime_right", "halfwidth"]
+    required_conditions = ["stim"]
+
+    def get_nondecision_time(self, conditions):
+        if conditions["stim"] < 0:
+            return self.nondectime_left
+        return self.nondectime_right
+
+class BoundCollapsingExponentialLeftRight(Bound):
+    name = "Left/right collapsing exponential bound"
+    required_parameters = ["B_left", "B_right", "tau"]
+    required_conditions = ["stim"]
+
+    def get_bound(self, t, conditions, **kwargs):
+        if conditions["stim"] < 0:
+            return self.B_left * np.exp(-self.tau * t)
+        return self.B_right * np.exp(-self.tau * t)
+
 model = Model(
     drift=DriftScaled(
         k=Fittable(minval=0, maxval=20),
         alpha=Fittable(minval=0.1, maxval=1.0)
     ),
     noise=NoiseConstant(noise=1),
-    bound=BoundCollapsingExponential(
-        B=Fittable(minval=0.1, maxval=0.8),
+    bound=BoundCollapsingExponentialLeftRight(
+        B_left=Fittable(minval=0.1, maxval=0.8),
+        B_right=Fittable(minval=0.1, maxval=0.8),
         tau=Fittable(minval=0.05, maxval=2.0)
     ),
     overlay=OverlayChain(overlays=[
-        OverlayNonDecisionUniform(nondectime=Fittable(minval=0.05, maxval=0.4),
-                                  halfwidth=Fittable(minval=0.0, maxval=0.2)),
+        OverlayNonDecisionUniformLeftRight(
+            nondectime_left=Fittable(minval=0.05, maxval=0.4),
+            nondectime_right=Fittable(minval=0.05, maxval=0.4),
+            halfwidth=Fittable(minval=0.0, maxval=0.2)
+        ),
         OverlayPoissonMixture(pmixturecoef=0.05, rate=1)
     ]),
     IC=ICPointFrac(x0_frac=Fittable(minval=-0.99, maxval=0.99)),
