@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from pyddm import Drift, Model, Sample
+from pyddm import Drift, Model
 from pyddm.models import (
     BoundCollapsingExponential,
     InitialCondition,
@@ -31,7 +31,6 @@ from pyddm.models import (
     OverlayNonDecisionUniform,
     OverlayPoissonMixture,
 )
-from pyddm.models.loss import LossRobustLikelihood
 
 
 DEFAULT_GRID = {
@@ -138,30 +137,19 @@ def condition_metrics(
     label: str,
     df: pd.DataFrame,
     model: Model,
+    sol_cache: dict[float, Any],
     compute_likelihood: bool,
 ) -> dict[str, Any]:
-    sample = Sample.from_pandas_dataframe(
-        df,
-        rt_column_name="rt",
-        choice_column_name="choice",
-    )
-
     nll = None
     nll_per_trial = None
     if compute_likelihood:
-        loss = LossRobustLikelihood(
-            sample=sample,
-            required_conditions=model.required_conditions,
-            dt=model.dt,
-            T_dur=model.T_dur,
-        )
-        nll = float(loss.loss(model))
+        nll = robust_nll_from_cache(df, sol_cache, model.dt)
         nll_per_trial = nll / len(df)
 
     rows = []
     for stim in sorted(df["stim"].unique()):
         subset = df[df["stim"] == stim]
-        sol = model.solve(conditions={"stim": float(stim)})
+        sol = sol_cache[float(stim)]
         p_model = float(sol.prob("upper_bound"))
         rt_model = float(sol.mean_rt())
         rows.append(
@@ -196,6 +184,36 @@ def condition_metrics(
         "rt_rmse_positive": rt_rmse_positive,
         "curve": rows,
     }
+
+
+def solve_stimuli_once(model: Model, dfs: list[pd.DataFrame]) -> dict[float, Any]:
+    stims = sorted({float(stim) for df in dfs for stim in df["stim"].unique()})
+    return {stim: model.solve(conditions={"stim": stim}) for stim in stims}
+
+
+def robust_nll_from_cache(df: pd.DataFrame, sol_cache: dict[float, Any], dt: float) -> float:
+    """PyDDM robust likelihood using already-solved stimulus conditions."""
+
+    loglikelihood = 0.0
+    robustness = 1e-20
+    for stim, subset in df.groupby("stim"):
+        sol = sol_cache[float(stim)]
+        upper_pdf = sol.pdf("_top")
+        lower_pdf = sol.pdf("_bottom")
+
+        upper_indexes = np.rint(subset.loc[subset["choice"] == 1, "rt"].to_numpy() / dt).astype(int)
+        lower_indexes = np.rint(subset.loc[subset["choice"] == 0, "rt"].to_numpy() / dt).astype(int)
+        upper_indexes = upper_indexes[(upper_indexes >= 0) & (upper_indexes < len(upper_pdf))]
+        lower_indexes = lower_indexes[(lower_indexes >= 0) & (lower_indexes < len(lower_pdf))]
+
+        try:
+            with np.errstate(all="raise", under="ignore"):
+                loglikelihood += float(np.sum(np.log(upper_pdf[upper_indexes] + robustness)))
+                loglikelihood += float(np.sum(np.log(lower_pdf[lower_indexes] + robustness)))
+        except FloatingPointError:
+            return float("inf")
+
+    return -loglikelihood
 
 
 def load_grid(grid_json: str | None) -> list[dict[str, float]]:
@@ -253,13 +271,20 @@ def main() -> None:
     if args.conditions in {"both", "wiggle"}:
         requested.append(("wiggle", Path(args.wiggle_pkl)))
 
-    metrics = {}
+    dataframes = []
     for offset, (label, path) in enumerate(requested):
         df = load_condition(path, block=block, sample_size=sample_size, seed=args.seed + offset)
+        dataframes.append((label, df))
+
+    sol_cache = solve_stimuli_once(model, [df for _, df in dataframes])
+
+    metrics = {}
+    for label, df in dataframes:
         metrics[label] = condition_metrics(
             label=label,
             df=df,
             model=model,
+            sol_cache=sol_cache,
             compute_likelihood=not args.skip_likelihood,
         )
 
